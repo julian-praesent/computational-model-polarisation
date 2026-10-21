@@ -1,0 +1,151 @@
+---
+title: 'Echo chambers: opinion against neighbours'' opinion'
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+An echo chamber means that agents mostly hear opinions like their own. To see whether that happens in our model, we compare each agent's opinion $x$ with $\langle x \rangle^{NN}$, the mean opinion of the agents it heard (its nearest neighbours), as in Fig. 3a of Baumann et al. (2020).
+
+The NetLogo model (`netlogo/polarisation.nlogox`, with `collect-snapshots?` on) records who heard whom over several time steps once the population is polarized, and writes one file per run with, among others, the columns `x` and `x_nn`. The Info tab of the model explains how. This notebook pools all runs of an m-mode and draws:
+
+-   in the main panel, the joint distribution of $x$ and $\langle x \rangle^{NN}$ (bright = many agents). Echo chambers show up as two bright spots, bottom left and top right: agents with a negative opinion hear negative opinions, and agents with a positive opinion positive ones.
+-   above it, the distribution of the opinions, $P(x)$
+-   to the right, the distribution of the neighbours' mean opinions, $P_{NN}(x)$
+
+Input and output:
+
+-   input: the .csv files in `data/snapshots/`, with one folder per m-mode (e.g. `data/snapshots/uniform/`) and one file per run
+-   output: one figure per m-mode in `results/snapshots/`, e.g. `results/snapshots/echo-chambers-uniform.png`
+
+```{r paths}
+library(MASS) # for kde2d(), the 2-D density estimate
+
+input_folder <- "../data/snapshots"
+output_folder <- "../results/snapshots"
+dir.create(output_folder, recursive = TRUE, showWarnings = FALSE)
+
+modes <- c("uniform", "boost-extreme", "uprank-bridging-and-downrank-toxic", "uprank-bridging")
+```
+
+## Settings
+
+The same settings are used for every m-mode:
+
+```{r settings}
+axis_limit <- 6 # both axes go from -6 to 6
+bandwidth <- 0.25 # how much the densities are smoothed (standard deviation of the kernel)
+grid_size <- 200 # the 2-D density is computed on a 200 x 200 grid
+max_points <- 50000 # at most this many agents are used for the 2-D density
+n_levels <- 15 # about this many colour levels
+palette <- "Inferno"
+```
+
+## Reading the runs
+
+Each run file has one row per agent. We only need the opinion `x` and the neighbours' mean opinion `x_nn`, so we keep those two columns and stack the files of one m-mode on top of each other.
+
+```{r read-function}
+read_runs <- function(mode) {
+  files <- list.files(file.path(input_folder, mode), pattern = "\\.csv$", full.names = TRUE)
+  runs <- lapply(files, function(file) read.csv(file)[, c("x", "x_nn")])
+  agents <- do.call(rbind, runs)
+  cat(mode, ":", length(files), "runs,", nrow(agents), "agents\n")
+  agents
+}
+```
+
+## Estimating the densities
+
+The marginal densities $P(x)$ and $P_{NN}(x)$ use all agents. The 2-D density takes much more memory, so if there are more than `max_points` agents it uses a random sample of them. The seed makes that sample the same every time.
+
+`kde2d()` and `density()` define the amount of smoothing differently: `density()` takes the standard deviation of the kernel, `kde2d()` four times that. We therefore pass `4 * bandwidth` to `kde2d()`, so that both are smoothed the same.
+
+```{r density-function}
+estimate_densities <- function(agents) {
+  limits <- c(-axis_limit, axis_limit)
+
+  set.seed(1)
+  if (nrow(agents) > max_points) {
+    sample_rows <- sample(nrow(agents), max_points)
+  } else {
+    sample_rows <- seq_len(nrow(agents))
+  }
+
+  joint <- kde2d(agents$x[sample_rows], agents$x_nn[sample_rows],
+    n = grid_size, lims = c(limits, limits), h = rep(4 * bandwidth, 2)
+  )
+
+  list(
+    joint = joint,
+    x = density(agents$x, bw = bandwidth, from = -axis_limit, to = axis_limit),
+    x_nn = density(agents$x_nn, bw = bandwidth, from = -axis_limit, to = axis_limit)
+  )
+}
+```
+
+## Drawing the figure
+
+The figure has three panels: the 2-D density in the main panel, $P(x)$ above it and $P_{NN}(x)$ to the right. `layout()` places them on a 2 x 2 grid: the numbers in its matrix say which panel goes where, with 0 for the empty top-right corner.
+
+```{r plot-function}
+plot_echo_chambers <- function(densities, file) {
+  limits <- c(-axis_limit, axis_limit)
+
+  png(file, width = 1600, height = 1600, res = 200)
+  layout(matrix(c(2, 0, 1, 3), nrow = 2, byrow = TRUE), widths = c(4, 1), heights = c(1, 4))
+
+  # 1. main panel: filled contours of the 2-D density
+  par(mar = c(4.5, 4.5, 0.5, 0.5))
+  levels <- pretty(range(densities$joint$z), n_levels)
+  plot.new()
+  plot.window(xlim = limits, ylim = limits, xaxs = "i", yaxs = "i")
+  .filled.contour(densities$joint$x, densities$joint$y, densities$joint$z,
+    levels = levels, col = hcl.colors(length(levels) - 1, palette)
+  )
+  axis(1)
+  axis(2)
+  box()
+  title(
+    xlab = expression(italic(x)),
+    ylab = expression(group(langle, italic(x), rangle)^NN)
+  )
+
+  # 2. top panel: P(x)
+  par(mar = c(0, 4.5, 0.5, 0.5))
+  plot(densities$x$x, densities$x$y,
+    type = "l", lwd = 2,
+    xlim = limits, xaxs = "i", xaxt = "n",
+    xlab = "", ylab = expression(italic(P)(italic(x)))
+  )
+
+  # 3. right panel: P_NN(x), turned on its side
+  par(mar = c(4.5, 0, 0.5, 0.5))
+  plot(densities$x_nn$y, densities$x_nn$x,
+    type = "l", lwd = 2,
+    ylim = limits, yaxs = "i", yaxt = "n",
+    xlab = expression(italic(P)[NN](italic(x))), ylab = ""
+  )
+
+  dev.off()
+}
+```
+
+## One figure per m-mode
+
+```{r figures, out.width = "70%"}
+files <- file.path(output_folder, paste0("echo-chambers-", modes, ".png"))
+
+for (k in seq_along(modes)) {
+  agents <- read_runs(modes[k])
+  densities <- estimate_densities(agents)
+  plot_echo_chambers(densities, files[k])
+}
+
+knitr::include_graphics(files)
+```
+

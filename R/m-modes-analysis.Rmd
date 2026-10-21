@@ -1,0 +1,257 @@
+---
+title: "Number of contacts: comparing the m-modes"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+In the paper every active agent contacts the same number of agents, $m = 10$. Our NetLogo model (`netlogo/polarisation.nlogox`) adds a setting, **m-mode**, that lets this number depend on how extreme an agent's opinion is. The mean over all agents always stays $m$; the modes only change who gets how many contacts:
+
+| m-mode | who gets more contacts |
+|--------|------------------------|
+| uniform | nobody: everyone contacts $m$ agents, as in the paper |
+| boost-extreme | extreme agents, up to `m-multiplier` = 6.7 times as many as neutral ones |
+| uprank-bridging and downrank-toxic | neutral agents, up to 6.7 times as many as extreme ones |
+| uprank-bridging | like the previous one, but the 20% most extreme agents keep the number they had before they became that extreme |
+
+The Info tab of the model explains the modes in detail.
+
+This notebook compares the four modes in the three regimes of Fig. 1 of the paper, using two measures taken at the end of each run:
+
+- $|\langle x \rangle|$ (`abs-mean-opinion`), the absolute mean opinion. It is large when everyone ends up on one side, but close to 0 both at consensus and when the population is split into two equal halves.
+- $\text{Var}(x)$ (`opinion-variance`), the variance of the opinions. It is close to 0 only at consensus.
+
+Input and output:
+
+- input: `data/m-modes/m-modes.csv`, the spreadsheet output of the BehaviorSpace experiment `m-modes`
+- output: `results/m-modes/`, a summary table and the plots
+
+```{r paths}
+input_file <- "../data/m-modes/m-modes.csv"
+output_folder <- "../results/m-modes"
+dir.create(output_folder, recursive = TRUE, showWarnings = FALSE)
+```
+
+## The data
+
+The spreadsheet output of BehaviorSpace starts with 6 lines about the experiment. After that, every row is one parameter or measure, and every run has four columns next to each other: the step at which the run ended and the three measures, in the order they were entered in BehaviorSpace. The first column holds the row names, such as `alpha` or `m-mode`.
+
+```{r read}
+sheet <- read.csv(input_file, skip = 6, header = FALSE, colClasses = "character")
+row_names <- sheet[, 1]
+sheet <- sheet[, -1]
+```
+
+The row `[final value]` names what is in each column (`[step]` or one of the measures), and the row below it holds the values at the end of the run. The parameters are written only in a run's first column, the one named `[step]`; the other three are empty. Two small functions pick out a parameter or a measure for all runs:
+
+```{r runs}
+final_names <- unlist(sheet[row_names == "[final value]", ])
+final_values <- unlist(sheet[which(row_names == "[final value]") + 1, ])
+first_column <- final_names == "[step]"
+
+parameter <- function(name) unname(unlist(sheet[row_names == name, first_column]))
+final_value <- function(name) as.numeric(final_values[final_names == name])
+
+runs <- data.frame(
+  alpha = as.numeric(parameter("alpha")),
+  beta = as.numeric(parameter("beta")),
+  mode = parameter("m-mode"),
+  t_end = final_value("[step]") * as.numeric(parameter("dt")),
+  abs_mean = final_value("abs-mean-opinion"),
+  variance = final_value("opinion-variance"),
+  mean_contacts = final_value("mean [ n-contacts ] of turtles")
+)
+head(runs)
+```
+
+The mean number of contacts should be $m = 10$ in every run, whatever the mode:
+
+```{r check-contacts}
+table(runs$mean_contacts)
+```
+
+All runs end at the same time:
+
+```{r end-time}
+t_end <- unique(runs$t_end)
+t_end
+```
+
+The experiment also contains combinations of $\alpha$ and $\beta$ that we don't use. We keep only the three regimes of Fig. 1 (`merge()` keeps the runs whose $\alpha$ and $\beta$ appear in `regimes`):
+
+```{r regimes}
+regimes <- data.frame(
+  alpha = c(0.05, 3, 3),
+  beta = c(2, 0, 3),
+  regime = c("consensus", "one-sided radicalization", "polarization")
+)
+runs <- merge(runs, regimes)
+
+modes <- c("uniform", "boost-extreme", "uprank-bridging and downrank-toxic", "uprank-bridging")
+runs$mode <- factor(runs$mode, levels = modes)
+runs$regime <- factor(runs$regime, levels = regimes$regime)
+
+run_counts <- table(runs$regime, runs$mode)
+run_counts
+```
+
+Every plot below states when the runs ended and how many runs there are per mode:
+
+```{r run-info}
+runs_per_mode <- paste(unique(as.vector(run_counts)), collapse = " or ")
+run_info <- paste0("t = ", t_end, ", ", runs_per_mode, " runs per m-mode")
+run_info
+```
+
+## Summary table
+
+For each regime and mode: the mean and standard deviation over the runs, and how many times larger the mean is than under uniform (the paper's model). A value of 2 means twice as large as uniform, 0.5 half as large.
+
+```{r summary}
+means <- aggregate(cbind(abs_mean, variance) ~ regime + mode, data = runs, FUN = mean)
+sds <- aggregate(cbind(abs_mean, variance) ~ regime + mode, data = runs, FUN = sd)
+
+summary_table <- data.frame(
+  regime = means$regime,
+  mode = means$mode,
+  abs_mean = means$abs_mean,
+  abs_mean_sd = sds$abs_mean,
+  variance = means$variance,
+  variance_sd = sds$variance
+)
+
+# divide by the uniform mean of the same regime
+uniform <- summary_table[summary_table$mode == "uniform", ]
+row_of_uniform <- match(summary_table$regime, uniform$regime)
+summary_table$abs_mean_vs_uniform <- summary_table$abs_mean / uniform$abs_mean[row_of_uniform]
+summary_table$variance_vs_uniform <- summary_table$variance / uniform$variance[row_of_uniform]
+
+summary_table <- summary_table[order(summary_table$regime, summary_table$mode), ]
+write.csv(summary_table, file.path(output_folder, "summary.csv"), row.names = FALSE)
+
+numbers <- sapply(summary_table, is.numeric)
+summary_table[numbers] <- signif(summary_table[numbers], 3)
+knitr::kable(summary_table, row.names = FALSE)
+```
+
+## Plots
+
+All plots use the same colour for each mode, and put the mode names on two lines where they are long:
+
+```{r plot-settings}
+mode_colours <- c("grey40", "firebrick", "steelblue", "darkorange")
+mode_labels <- c("uniform", "boost-extreme", "uprank-bridging\nand downrank-toxic", "uprank-bridging")
+
+# plot title with the values of alpha and beta of a regime
+regime_title <- function(regime) {
+  r <- regimes[regimes$regime == regime, ]
+  bquote(alpha == .(r$alpha) * "," ~~ beta == .(r$beta))
+}
+```
+
+### Each measure per mode
+
+One figure per measure, with one panel per regime. Each coloured dot is one run. Next to them, the black dot is the mean and the bar the mean $\pm$ one standard deviation. The dashed line is the uniform mean, so a mode above the line increases the measure compared to the paper's model.
+
+The values span several orders of magnitude (from about $10^{-10}$ at consensus to about 40), so the y-axis is logarithmic. A log axis can't show values $\le 0$, so where mean $-$ sd is below the lowest run, the bar is cut off at the bottom of the plot.
+
+```{r dot-plot-function}
+plot_measure <- function(measure, label, file) {
+  values <- runs[[measure]]
+  png(file, width = 1500, height = 600, res = 110)
+  par(mfrow = c(1, 3), mar = c(10.5, 4.5, 5, 1), oma = c(0, 0, 2.5, 0))
+
+  for (regime in levels(runs$regime)) {
+    in_regime <- runs$regime == regime
+    mode_number <- as.integer(runs$mode[in_regime])
+
+    plot(jitter(mode_number - 0.1, amount = 0.08), values[in_regime],
+      log = "y", ylim = range(values),
+      xlim = c(0.5, 4.5), xaxt = "n", xlab = "", ylab = label,
+      pch = 19, cex = 0.6, col = mode_colours[mode_number]
+    )
+    axis(1, at = 1:4, labels = mode_labels, las = 2)
+    title(regime_title(regime), line = 2.5, cex.main = 1.5)
+    mtext(regime, side = 3, line = 0.5)
+
+    mean_per_mode <- tapply(values[in_regime], runs$mode[in_regime], mean)
+    sd_per_mode <- tapply(values[in_regime], runs$mode[in_regime], sd)
+    bar_bottom <- pmax(mean_per_mode - sd_per_mode, min(values))
+    arrows(1:4 + 0.2, bar_bottom, 1:4 + 0.2, mean_per_mode + sd_per_mode,
+      angle = 90, code = 3, length = 0.04, lwd = 2
+    )
+    points(1:4 + 0.2, mean_per_mode, pch = 19, cex = 1.5)
+    abline(h = mean_per_mode["uniform"], lty = 2)
+  }
+
+  mtext(paste0(label, " at the end of the run (", run_info, ")"),
+    outer = TRUE, cex = 1.1
+  )
+  dev.off()
+}
+```
+
+```{r abs-mean-plot}
+plot_measure("abs_mean", "|<x>|", file.path(output_folder, "abs-mean-opinion.png"))
+knitr::include_graphics(file.path(output_folder, "abs-mean-opinion.png"))
+```
+
+```{r variance-plot}
+plot_measure("variance", "Var(x)", file.path(output_folder, "opinion-variance.png"))
+knitr::include_graphics(file.path(output_folder, "opinion-variance.png"))
+```
+
+### Distribution of the variance
+
+The dot plots above summarise each mode by its mean. A violin plot shows the whole distribution of the variance over the runs: the width of a violin shows how many runs ended with that variance, like a histogram turned on its side and smoothed. The box inside is a boxplot (thick line: median; box: middle 50% of the runs), and the dots are the individual runs.
+
+There is one plot per regime, each with its own (logarithmic) y-axis, because the regimes differ too much to share one. The plots are wide (16:9) so they fit on a slide.
+
+```{r violin-function}
+plot_violins <- function(regime, file) {
+  in_regime <- runs$regime == regime
+  variance <- runs$variance[in_regime]
+  mode <- runs$mode[in_regime]
+
+  png(file, width = 3200, height = 1800, res = 300)
+  par(mar = c(5, 5, 5, 1))
+  plot(NA,
+    log = "y", xlim = c(0.5, 4.5), ylim = range(variance),
+    xaxt = "n", xlab = "", ylab = "opinion variance at the end of the run"
+  )
+  axis(1, at = 1:4, labels = mode_labels, padj = 0.5)
+  title(regime_title(regime), line = 3, cex.main = 1.6)
+  mtext(paste0(regime, ", ", run_info), side = 3, line = 0.8)
+
+  # the violin is the density of log10(variance), drawn to both sides;
+  # cut = 0 makes it end at the smallest and largest run
+  for (k in 1:4) {
+    d <- density(log10(variance[mode == modes[k]]), cut = 0)
+    half_width <- 0.4 * d$y / max(d$y)
+    polygon(c(k - half_width, rev(k + half_width)), 10^c(d$x, rev(d$x)),
+      col = adjustcolor(mode_colours[k], alpha.f = 0.4), border = mode_colours[k]
+    )
+  }
+
+  boxplot(variance ~ mode,
+    at = 1:4, add = TRUE, boxwex = 0.15,
+    outline = FALSE, axes = FALSE, col = "white"
+  )
+  points(jitter(as.integer(mode), amount = 0.04), variance, pch = 19, cex = 0.6)
+  dev.off()
+}
+```
+
+```{r violins, out.width = "100%"}
+violin_files <- file.path(output_folder, paste0(
+  "variance-violin-alpha", regimes$alpha, "-beta", regimes$beta, ".png"
+))
+for (k in 1:3) {
+  plot_violins(regimes$regime[k], violin_files[k])
+}
+knitr::include_graphics(violin_files)
+```

@@ -1,0 +1,1335 @@
+<?xml version="1.0" encoding="utf-8"?>
+<model version="NetLogo 7.0.4" snapToGrid="true">
+  <code><![CDATA[; Opinion dynamics model of Baumann et al. (2020), "Modeling Echo Chambers
+; and Polarization Dynamics in Social Networks", PRL 124, 048301, with two
+; additions of our own. The code has three parts:
+;
+;   PART 1  the model of the paper, following the algorithm in section
+;           "Numerical simulations" of the Supplementary Material (SM)
+;   PART 2  extension: the number of contacts depends on the opinion (m-mode)
+;   PART 3  optional: echo-chamber snapshots, only used when the switch
+;           collect-snapshots? is on
+;
+; followed by reporters for monitors and BehaviorSpace, the view, and the
+; Fig. 1 presets. The Info tab explains all of it.
+
+extensions [ rnd csv ]
+
+; Part 1: the network of the current time step. A link from j to i means
+; that j influences i, i.e. A_ij(t) = 1 in Eq. (1).
+directed-link-breed [ influences influence ]
+
+; Part 3: all contacts seen in the snapshots, added up. A link from j to i
+; means that j influenced i in at least one snapshot.
+directed-link-breed [ heard-links heard-link ]
+heard-links-own [
+  weight  ; in how many snapshots j influenced i
+]
+
+globals [
+  plotted          ; agents whose trajectories are drawn in the "Opinions" plot
+
+  ; part 3
+  snapshot-state   ; "waiting" (for polarization), "collecting" or "exported"
+  snapshots-taken  ; number of snapshots recorded so far
+  ticks-collecting ; time steps since the collection started
+]
+
+turtles-own [
+  opinion        ; x_i
+  activity       ; a_i, probability of being active in a time step
+  x-stage        ; opinion at the current Runge-Kutta stage
+  signal         ; f(alpha * x-stage), the influence this agent exerts on
+                 ; others, where f is the chosen influence function (tanh in the paper)
+  k1 k2 k3 k4    ; Runge-Kutta slopes
+
+  ; part 2
+  n-contacts     ; number of agents contacted when active (m in the paper)
+  contact-share  ; n-contacts before rounding to a whole number
+
+  ; part 3
+  x-nn           ; mean opinion of the agent's neighbours in the snapshots
+  k-nn           ; number of those neighbours (or their total weight)
+]
+
+
+;;;; PART 1: THE MODEL OF BAUMANN ET AL. (2020) ;;;;
+
+to setup
+  clear-all
+  if N <= m [ user-message "N must be larger than m." stop ]
+
+  ; In BehaviorSpace the random seed is the run number, so that every run can
+  ; be repeated exactly. Outside BehaviorSpace (run number 0) every setup is
+  ; a new random run.
+  if behaviorspace-run-number > 0 [ random-seed behaviorspace-run-number ]
+
+  ; agents are created with who = 0 ... N - 1, so opinions are uniformly
+  ; spaced on [-1, 1] (paper, p. 3)
+  create-turtles N [
+    set opinion -1 + 2 * who / (N - 1)
+    set activity sample-activity
+    set shape "circle"
+    set size 0.5
+  ]
+  update-contacts false  ; part 2
+
+  ; draw evenly spaced agents, so the plot covers the whole initial range
+  let every-nth max list 1 floor (N / n-plotted)
+  set plotted turtles with [ who mod every-nth = 0 ]
+
+  setup-snapshots  ; part 3
+  update-view
+  reset-ticks
+end
+
+; Draws an activity from F(a) = (1 - gamma) / (1 - epsilon^(1 - gamma)) a^(-gamma)
+; on [epsilon, 1] by inverse transform sampling: setting the CDF
+; (a^(1 - gamma) - epsilon^(1 - gamma)) / (1 - epsilon^(1 - gamma)) equal to a
+; uniform u and solving for a.
+to-report sample-activity
+  let u random-float 1
+  report (epsilon ^ (1 - gamma) + u * (1 - epsilon ^ (1 - gamma))) ^ (1 / (1 - gamma))
+end
+
+to go
+  if run-finished? [ stop ]
+  build-network
+
+  ; part 3: the snapshot must be taken before the opinions change
+  if collect-snapshots? [ record-snapshot ]
+
+  rk4-step
+  tick
+  update-view
+
+  ; part 3: once all snapshots are taken, write them to a file
+  if collect-snapshots? [ export-if-complete ]
+end
+
+; Without snapshots a run lasts until t-final, as in the paper. With
+; snapshots it lasts until the snapshots are exported, or until
+; snapshot-max-t if the population never polarizes.
+to-report run-finished?
+  if collect-snapshots? [
+    report snapshot-state = "exported" or ticks >= round (snapshot-max-t / dt)
+  ]
+  report ticks >= round (t-final / dt)
+end
+
+; Steps 1-3 and 5 of the SM algorithm.
+to build-network
+  ; 5. delete the network of the previous time step
+  ask influences [ die ]
+
+  ; part 2: how many agents each agent contacts in this step
+  update-contacts true
+
+  ; 1. each agent i is activated with probability a_i
+  ask turtles with [ random-float 1 < activity ] [
+    ; 2. agent i influences n-contacts distinct agents chosen by homophily,
+    ;    Eq. (2): A_ji = 1. In the paper n-contacts = m.
+    let x-i opinion
+    let targets rnd:weighted-n-of n-contacts other turtles [
+      homophily-weight (abs (opinion - x-i))
+    ]
+    create-influences-to targets
+
+    ; 3. with probability r each contacted agent j influences i back
+    ask targets [
+      if random-float 1 < r [
+        create-influence-to myself
+      ]
+    ]
+  ]
+end
+
+; Unnormalised contact probability of Eq. (2), |x_i - x_j|^(-beta);
+; rnd:weighted-n-of does the normalisation. Distances are floored at 1e-12,
+; because identical opinions would give an infinite weight.
+to-report homophily-weight [ d ]
+  report (max list d 1e-12) ^ (- beta)
+end
+
+; Step 4 of the SM algorithm: integrates Eq. (1) over one time step with the
+; explicit fourth-order Runge-Kutta method. The network stays fixed during the
+; step; only the opinions inside f(alpha * x) change between the stages.
+to rk4-step
+  ask turtles [ set x-stage opinion ]
+  update-signals
+  ask turtles [ set k1 slope ]                 ; slope at the start
+
+  ask turtles [ set x-stage opinion + dt / 2 * k1 ]
+  update-signals
+  ask turtles [ set k2 slope ]                 ; slope at the midpoint, using k1
+
+  ask turtles [ set x-stage opinion + dt / 2 * k2 ]
+  update-signals
+  ask turtles [ set k3 slope ]                 ; slope at the midpoint, using k2
+
+  ask turtles [ set x-stage opinion + dt * k3 ]
+  update-signals
+  ask turtles [ set k4 slope ]                 ; slope at the end, using k3
+
+  ; weighted average of the four slopes (midpoint slopes count double)
+  ask turtles [ set opinion opinion + dt / 6 * (k1 + 2 * k2 + 2 * k3 + k4) ]
+end
+
+; All signals must be updated before any slope is computed, so this is a
+; separate ask.
+to update-signals
+  ask turtles [ set signal social-influence (alpha * x-stage) ]
+end
+
+; Right-hand side of Eq. (1), dx_i/dt = -x_i + K sum_j A_ij tanh(alpha x_j)
+; (with tanh replaced by the chosen influence function), evaluated at the
+; current Runge-Kutta stage.
+to-report slope
+  report (- x-stage) + K * sum [ signal ] of in-influence-neighbors
+end
+
+; Influence function chosen with influence-function; tanh is the paper's.
+; All options except sign have slope 1 at z = 0, so that f(alpha * x) has
+; slope alpha there, and all are bounded by +-1 except linear. The mean-field
+; alpha_c of Eq. (3) only depends on that slope, so it holds for all of them
+; except sign.
+to-report social-influence [ z ]
+  if influence-function = "tanh"      [ report tanh z ]
+  if influence-function = "clip"      [ report max list -1 min list 1 z ]
+  if influence-function = "arctan"    [ report 2 / pi * arctan (pi / 2 * z) ]
+  if influence-function = "algebraic" [ report z / sqrt (1 + z * z) ]
+  if influence-function = "linear"    [ report z ]
+  if influence-function = "sign"      [ report sign z ]
+  error (word "Unknown influence function: " influence-function)
+end
+
+; NetLogo has no tanh. Written with exp(-2|z|) so it cannot overflow.
+to-report tanh [ z ]
+  let q exp (-2 * abs z)
+  report ifelse-value z >= 0 [ (1 - q) / (1 + q) ] [ (q - 1) / (1 + q) ]
+end
+
+; NetLogo's atan reports a heading in degrees in [0, 360); this converts it
+; to the usual arctangent in radians, in (-pi / 2, pi / 2).
+to-report arctan [ z ]
+  let degrees atan z 1
+  if degrees > 180 [ set degrees degrees - 360 ]
+  report degrees * pi / 180
+end
+
+to-report sign [ z ]
+  report ifelse-value z > 0 [ 1 ] [ ifelse-value z < 0 [ -1 ] [ 0 ] ]
+end
+
+
+;;;; PART 2: EXTENSION: NUMBER OF CONTACTS (m-mode) ;;;;
+
+; Sets n-contacts, the number of agents each agent contacts when it is
+; active, according to m-mode. The mean of n-contacts over all agents is
+; always m, so the modes only change who gets how many contacts, not how many
+; there are in total.
+;
+; Each agent gets a weight (see contact-weight); the m * N contacts are then
+; shared out in proportion to the weights.
+;   uniform:       all weights are equal, so everyone contacts m agents, as in
+;                  the paper.
+;   boost-extreme: the most extreme agent gets m-multiplier times the weight
+;                  of a neutral agent, with linear steps in between.
+;   uprank-bridging and downrank-toxic:
+;                  the reverse: a neutral agent gets m-multiplier times the
+;                  weight of the most extreme agent.
+;   uprank-bridging:
+;                  like "uprank-bridging and downrank-toxic", but the
+;                  extreme-share % of agents with the largest |x| keep the
+;                  n-contacts they had before they entered that group; it is
+;                  not recomputed while they stay, and the other agents share
+;                  the rest of the m * N contacts.
+; freeze? is false in setup, so that every agent starts with a value.
+to update-contacts [ freeze? ]
+  if not member? m-mode [ "uniform" "boost-extreme" "uprank-bridging and downrank-toxic" "uprank-bridging" ] [
+    error (word "Unknown m-mode: " m-mode)
+  ]
+  let max-abs-opinion max [ abs opinion ] of turtles
+
+  ; agents whose n-contacts is not recomputed this step
+  let frozen no-turtles
+  if m-mode = "uprank-bridging" and freeze? [
+    set frozen max-n-of round (count turtles * extreme-share / 100) turtles [ abs opinion ]
+  ]
+  let free turtles with [ not member? self frozen ]
+  if not any? free [ stop ]
+
+  ; contacts left for the free agents, so that the mean over all agents is m
+  let budget max list 0 (m * count turtles - sum [ n-contacts ] of frozen)
+  let total-weight sum [ contact-weight max-abs-opinion ] of free
+
+  ; contacts must be whole numbers: first round everyone down, then give one
+  ; extra contact each to the agents that lost the most by rounding, until
+  ; the budget is used up. (Plain rounding would let the mean drift from m.)
+  ask free [
+    set contact-share budget * contact-weight max-abs-opinion / total-weight
+    set n-contacts floor contact-share
+  ]
+  let left-over budget - sum [ n-contacts ] of free
+  ask max-n-of left-over free [ contact-share - n-contacts ] [
+    set n-contacts n-contacts + 1
+  ]
+
+  ; can't contact more agents than there are (only matters for small N; the
+  ; mean is then a bit below m)
+  ask free [ set n-contacts min list n-contacts (count turtles - 1) ]
+end
+
+; Relative number of contacts of this agent, from 1 to m-multiplier.
+; "extremeness" is |x_i| divided by the largest |x| in the population, so it
+; runs from 0 (neutral) to 1 (the most extreme agent).
+to-report contact-weight [ max-abs-opinion ]
+  let extremeness 0
+  if max-abs-opinion > 0 [ set extremeness abs opinion / max-abs-opinion ]
+
+  let boost 0  ; 0 gives weight 1, 1 gives weight m-multiplier
+  if m-mode = "boost-extreme" [ set boost extremeness ]
+  if m-mode = "uprank-bridging and downrank-toxic" or m-mode = "uprank-bridging" [ set boost 1 - extremeness ]
+  report 1 + (m-multiplier - 1) * boost
+end
+
+
+;;;; PART 3: OPTIONAL: ECHO-CHAMBER SNAPSHOTS ;;;;
+
+; Only used when collect-snapshots? is on.
+;
+; The network of a single time step only has a few links per agent. To see
+; who an agent hears over a longer stretch, the networks of several time
+; steps ("snapshots") are added up into one network of heard-links. The
+; collection starts once the population is polarized. When enough snapshots
+; are taken, each agent's opinion x is compared with x_nn, the mean opinion of
+; the agents it heard (Fig. 3a of the paper), and the result is written to
+; snapshot-folder/snapshots-run-<BehaviorSpace run number>.csv.
+
+to setup-snapshots
+  set snapshot-state "waiting"
+  set snapshots-taken 0
+  set ticks-collecting 0
+end
+
+; Polarized means: both sides hold more than snapshot-min-side-share of the
+; agents, and the mean conviction |x| is above snapshot-min-conviction.
+to-report polarized?
+  let share-positive (count turtles with [ opinion > 0 ]) / count turtles
+  report share-positive > snapshot-min-side-share
+    and share-positive < 1 - snapshot-min-side-share
+    and mean [ abs opinion ] of turtles > snapshot-min-conviction
+end
+
+; Called every time step, right after the network is built, so that a
+; snapshot holds exactly the contacts used in that step.
+to record-snapshot
+  ; the collection starts at the first polarized time step and then goes on,
+  ; even if the population stops being polarized
+  if snapshot-state = "waiting" and polarized? [ set snapshot-state "collecting" ]
+  if snapshot-state != "collecting" [ stop ]
+
+  ; take a snapshot right away, then one every snapshot-spacing time steps
+  if ticks-collecting mod snapshot-spacing = 0 and snapshots-taken < snapshot-count [
+    ask influences [
+      let listener end2
+      ask end1 [
+        ifelse out-heard-link-neighbor? listener [
+          ask out-heard-link-to listener [ set weight weight + 1 ]
+        ] [
+          create-heard-link-to listener [ set weight 1 hide-link ]
+        ]
+      ]
+    ]
+    set snapshots-taken snapshots-taken + 1
+  ]
+  set ticks-collecting ticks-collecting + 1
+end
+
+to export-if-complete
+  if snapshot-state = "collecting" and snapshots-taken = snapshot-count [
+    compute-neighbour-opinions
+    write-snapshot-file
+    set snapshot-state "exported"
+  ]
+end
+
+; x-nn and k-nn of every agent. The neighbours are the agents it heard
+; (snapshot-neighbours = "in"), or also the agents that heard it
+; ("in and out"). With snapshot-weighted? on, a neighbour counts once for
+; every snapshot in which the two were in contact; otherwise it counts once.
+to compute-neighbour-opinions
+  ask turtles [
+    set x-nn 0
+    set k-nn 0
+
+    let contacts my-in-heard-links
+    if snapshot-neighbours = "in and out" [
+      set contacts (link-set my-in-heard-links my-out-heard-links)
+    ]
+
+    ifelse snapshot-weighted? [
+      set k-nn sum [ weight ] of contacts
+      if k-nn > 0 [
+        set x-nn (sum [ weight * [ opinion ] of other-end ] of contacts) / k-nn
+      ]
+    ] [
+      let neighbours turtle-set [ other-end ] of contacts
+      set k-nn count neighbours
+      if k-nn > 0 [ set x-nn mean [ opinion ] of neighbours ]
+    ]
+  ]
+end
+
+; One row per agent that has at least one neighbour. The first columns repeat
+; the run's parameters, so that every file can be read on its own.
+to write-snapshot-file
+  let rows (list [ "run" "alpha" "beta" "K" "m_mode" "t" "agent" "x" "x_nn" "k" "activity" ])
+  foreach sort turtles with [ k-nn > 0 ] [ agent ->
+    ask agent [
+      set rows lput (list behaviorspace-run-number alpha beta K m-mode t
+                          who opinion x-nn k-nn activity) rows
+    ]
+  ]
+  csv:to-file (word snapshot-folder "snapshots-run-" behaviorspace-run-number ".csv") rows
+end
+
+
+;;;; REPORTERS (monitors, plots and BehaviorSpace) ;;;;
+
+; time in the units of Eq. (1)
+to-report t
+  report ticks * dt
+end
+
+; |<x_f>| in Fig. 2: absolute value of the average opinion
+to-report abs-mean-opinion
+  report abs mean [ opinion ] of turtles
+end
+
+; variance of the opinions, i.e. how spread out they are: 0 at consensus,
+; large when opinions are far apart (radicalized or polarized)
+to-report opinion-variance
+  report variance [ opinion ] of turtles
+end
+
+; <a> = (1 - gamma) / (2 - gamma) * (1 - epsilon^(2 - gamma)) / (1 - epsilon^(1 - gamma))
+; (SM, "Approximation of the critical controversialness")
+to-report mean-activity
+  report (1 - gamma) / (2 - gamma) * (1 - epsilon ^ (2 - gamma)) / (1 - epsilon ^ (1 - gamma))
+end
+
+; mean-field critical controversialness, Eq. (3):
+; alpha_c = 1 / ((1 + r) K m <a>)
+to-report critical-alpha
+  report 1 / ((1 + r) * K * m * mean-activity)
+end
+
+; text for the snapshot monitor
+to-report snapshot-status
+  if not collect-snapshots? [ report "off" ]
+  if snapshot-state = "collecting" [
+    report (word "collecting (" snapshots-taken " of " snapshot-count ")")
+  ]
+  report snapshot-state
+end
+
+
+;;;; VIEW ;;;;
+
+; x-axis: opinion (clipped at +-view-range), y-axis: log activity, so that the
+; activity-opinion relation of Fig. 3b becomes visible.
+; Positive opinions are blue, negative ones red, as in Fig. 1.
+to update-view
+  ask turtles [
+    let x opinion / view-range * max-pxcor
+    setxy (max list min-pxcor min list max-pxcor x)
+          (max-pycor * (ln activity - ln epsilon) / (- ln epsilon))
+    set color ifelse-value opinion > 0 [ blue ] [ red ]
+  ]
+  ask influences [ set hidden? not show-links? set color gray ]
+end
+
+
+;;;; FIG. 1 PRESETS (K = 3, r = 0.5) ;;;;
+
+to preset-fig1 [ new-alpha new-beta ]
+  set alpha new-alpha
+  set beta new-beta
+  set K 3
+  set r 0.5
+  setup
+end
+]]></code>
+  <widgets>
+    <view x="230" wrappingAllowedX="false" y="10" frameRate="30.0" minPycor="0" height="186" showTickCounter="true" patchSize="6.0" fontSize="10" wrappingAllowedY="false" width="486" tickCounterLabel="ticks" maxPycor="30" updateMode="1" maxPxcor="40" minPxcor="-40"></view>
+    <button x="10" y="10" height="35" disableUntilTicks="false" forever="false" kind="Observer" width="100" display="setup">setup</button>
+    <button x="115" y="10" height="35" disableUntilTicks="true" forever="true" kind="Observer" width="105" display="go">go</button>
+    <button x="10" y="50" height="35" disableUntilTicks="false" forever="false" kind="Observer" width="68" display="Fig. 1a">preset-fig1 0.05 2</button>
+    <button x="81" y="50" height="35" disableUntilTicks="false" forever="false" kind="Observer" width="68" display="Fig. 1b">preset-fig1 3 0</button>
+    <button x="152" y="50" height="35" disableUntilTicks="false" forever="false" kind="Observer" width="68" display="Fig. 1c">preset-fig1 3 3</button>
+    <note x="10" y="92" backgroundDark="0" fontSize="12" width="210" markdown="false" height="20" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Model (Baumann et al. 2020)</note>
+    <slider x="10" step="10" y="115" max="2000" width="210" display="N" height="50" min="20" direction="Horizontal" default="1000.0" variable="N"></slider>
+    <slider x="10" step="0.05" y="165" max="5" width="210" display="alpha" height="50" min="0.05" direction="Horizontal" default="3.0" variable="alpha"></slider>
+    <slider x="10" step="0.1" y="215" max="5" width="210" display="beta" height="50" min="0" direction="Horizontal" default="3.0" variable="beta"></slider>
+    <slider x="10" step="0.1" y="265" max="5" width="210" display="K" height="50" min="0.1" direction="Horizontal" default="3.0" variable="K"></slider>
+    <slider x="10" step="0.05" y="315" max="1" width="210" display="r" height="50" min="0" direction="Horizontal" default="0.5" variable="r"></slider>
+    <slider x="10" step="1" y="365" max="50" width="210" display="m" height="50" min="1" direction="Horizontal" default="10.0" variable="m"></slider>
+    <slider x="10" step="0.001" y="415" max="0.1" width="210" display="epsilon" height="50" min="0.001" direction="Horizontal" default="0.01" variable="epsilon"></slider>
+    <slider x="10" step="0.1" y="465" max="3" width="210" display="gamma" height="50" min="0" direction="Horizontal" default="2.1" variable="gamma"></slider>
+    <input x="10" multiline="false" y="520" height="60" variable="dt" type="number" width="105">0.01</input>
+    <input x="115" multiline="false" y="520" height="60" variable="t-final" type="number" width="105">10.0</input>
+    <chooser x="10" y="585" height="60" variable="influence-function" current="0" width="210" display="influence-function">
+      <choice type="string" value="tanh"></choice>
+      <choice type="string" value="clip"></choice>
+      <choice type="string" value="arctan"></choice>
+      <choice type="string" value="algebraic"></choice>
+      <choice type="string" value="linear"></choice>
+      <choice type="string" value="sign"></choice>
+    </chooser>
+    <monitor x="230" precision="2" y="205" height="60" fontSize="11" width="110" display="t">t</monitor>
+    <monitor x="345" precision="3" y="205" height="60" fontSize="11" width="110" display="|⟨x⟩|">abs-mean-opinion</monitor>
+    <monitor x="460" precision="4" y="205" height="60" fontSize="11" width="110" display="⟨a⟩">mean-activity</monitor>
+    <monitor x="575" precision="3" y="205" height="60" fontSize="11" width="141" display="α_c, Eq. (3)">ifelse-value influence-function = "sign" or m-mode != "uniform" [ "n/a" ] [ critical-alpha ]</monitor>
+    <plot x="230" autoPlotX="false" yMax="1.0" autoPlotY="true" yAxis="x_i(t)" y="270" xMin="0.0" height="300" legend="false" xMax="10.0" yMin="-1.0" width="486" xAxis="t" display="Opinions (Fig. 1)">
+      <setup>set-plot-x-range 0 t-final
+ask plotted [ create-temporary-plot-pen (word who) ]</setup>
+      <update><![CDATA[ask plotted [
+  set-current-plot-pen (word who)
+  set-plot-pen-color ifelse-value opinion > 0 [ blue ] [ red ]
+  plotxy t opinion
+]]]></update>
+    </plot>
+    <plot x="725" autoPlotX="false" yMax="10.0" autoPlotY="true" yAxis="count" y="10" xMin="-1.0" height="280" legend="false" xMax="1.0" yMin="0.0" width="320" xAxis="x" display="Opinion distribution (Fig. S1b)">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="1" display="opinions" color="-16777216" legend="false">
+        <setup></setup>
+        <update>let lo floor min [ opinion ] of turtles
+let hi ceiling max [ opinion ] of turtles
+if hi = lo [ set hi lo + 1 ]
+set-plot-x-range lo hi
+set-histogram-num-bars 50
+histogram [ opinion ] of turtles</update>
+      </pen>
+    </plot>
+    <plot x="725" autoPlotX="true" yMax="1.0" autoPlotY="true" yAxis="Var(x)" y="295" xMin="0.0" height="250" legend="false" xMax="10.0" yMin="0.0" width="320" xAxis="t" display="Opinion variance">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="variance" color="-16777216" legend="false">
+        <setup></setup>
+        <update>plotxy t opinion-variance</update>
+      </pen>
+    </plot>
+    <chooser x="235" y="605" height="60" variable="m-mode" current="0" width="210" display="m-mode">
+      <choice type="string" value="uniform"></choice>
+      <choice type="string" value="boost-extreme"></choice>
+      <choice type="string" value="uprank-bridging and downrank-toxic"></choice>
+      <choice type="string" value="uprank-bridging"></choice>
+    </chooser>
+    <slider x="235" step="5" y="720" max="100" width="210" display="extreme-share" height="50" min="0" direction="Horizontal" default="20.0" variable="extreme-share" units="%"></slider>
+    <slider x="235" step="0.1" y="670" max="10" width="210" display="m-multiplier" height="50" min="1" direction="Horizontal" default="6.7" variable="m-multiplier"></slider>
+    <note x="235" y="582" backgroundDark="0" fontSize="12" width="210" markdown="false" height="20" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Extension: number of contacts</note>
+    <note x="505" y="580" backgroundDark="0" fontSize="12" width="210" markdown="false" height="25" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Plot settings</note>
+    <slider x="505" step="1" y="660" max="20" width="210" display="view-range" height="50" min="1" direction="Horizontal" default="10.0" variable="view-range"></slider>
+    <switch x="505" y="710" height="40" on="false" variable="show-links?" width="210" display="show-links?"></switch>
+    <slider x="505" step="10" y="610" max="1000" width="210" display="n-plotted" height="50" min="10" direction="Horizontal" default="100.0" variable="n-plotted"></slider>
+    <note x="1055" y="5" backgroundDark="0" fontSize="12" width="650" markdown="false" height="40" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">OPTIONAL: ECHO-CHAMBER SNAPSHOTS
+Everything below is only used when collect-snapshots? is on (see the Info tab).</note>
+    <switch x="1055" y="55" height="40" on="false" variable="collect-snapshots?" width="250" display="collect-snapshots?"></switch>
+    <slider x="1055" step="1" y="115" max="1000" width="250" display="snapshot-count" height="50" min="1" direction="Horizontal" default="45.0" variable="snapshot-count"></slider>
+    <slider x="1055" step="0.05" y="170" max="0.5" width="250" display="snapshot-min-side-share" height="50" min="0" direction="Horizontal" default="0.2" variable="snapshot-min-side-share"></slider>
+    <slider x="1055" step="1" y="225" max="100" width="250" display="snapshot-max-t" height="50" min="1" direction="Horizontal" default="50.0" variable="snapshot-max-t"></slider>
+    <switch x="1055" y="285" height="40" on="false" variable="snapshot-weighted?" width="250" display="snapshot-weighted?"></switch>
+    <monitor x="1320" precision="0" y="55" height="60" fontSize="11" width="250" display="snapshots">snapshot-status</monitor>
+    <input x="1320" multiline="false" y="295" height="60" variable="snapshot-folder" type="string" width="250">../data/snapshots/</input>
+    <chooser x="1320" y="230" height="60" variable="snapshot-neighbours" current="0" width="250" display="snapshot-neighbours">
+      <choice type="string" value="in"></choice>
+      <choice type="string" value="in and out"></choice>
+    </chooser>
+    <slider x="1320" step="0.5" y="175" max="100" width="250" display="snapshot-min-conviction" height="50" min="0" direction="Horizontal" default="1.0" variable="snapshot-min-conviction"></slider>
+    <slider x="1320" step="1" y="120" max="100" width="250" display="snapshot-spacing" height="50" min="1" direction="Horizontal" default="1.0" variable="snapshot-spacing" units="steps"></slider>
+    <monitor x="725" precision="3" y="560" height="60" fontSize="11" width="155" display="Var(x), opinion variance">opinion-variance</monitor>
+    <monitor x="900" precision="2" y="560" height="60" fontSize="11" width="145" display="mean m (contacts)">mean [ n-contacts ] of turtles</monitor>
+  </widgets>
+  <info><![CDATA[## WHAT IS IT?
+
+A replication of the opinion dynamics model of Baumann et al. (2020), *Modeling Echo Chambers and Polarization Dynamics in Social Networks*, PRL 124, 048301, with two additions of our own.
+
+Agents with different activity levels talk to each other on a network that changes every time step, prefer partners with similar opinions, and reinforce each other's opinions. Depending on the parameters, the population reaches a neutral consensus, radicalizes to one side, or polarizes into two opposing groups (echo chambers).
+
+The model has three parts, which are also the three parts of the code and the three groups on the interface:
+
+1. **The model of the paper.** Everything needed to reproduce Figs. 1 and 2.
+2. **Extension: number of contacts.** The number of agents an active agent contacts can depend on how extreme its opinion is (**m-mode**). With m-mode = uniform the model is exactly the paper's.
+3. **Optional: echo-chamber snapshots.** Records who talks to whom over several time steps once the population is polarized, and writes it to a file. Only used when **collect-snapshots?** is on.
+
+## HOW IT WORKS
+
+Each agent i holds an opinion x_i. Its sign is the side the agent is on and its absolute value how strongly it holds the opinion. Opinions follow Eq. (1) of the paper:
+
+    dx_i/dt = -x_i + K * sum_j A_ij(t) * tanh(alpha * x_j)
+
+where A_ij(t) = 1 if agent j influences agent i at time t. In the model a directed link from j to i means exactly that.
+
+Each agent gets an activity a_i between epsilon and 1 once, at setup, drawn from the power law F(a) ~ a^(-gamma): most agents are rarely active, a few very often. Opinions start evenly spaced between -1 and 1.
+
+Every tick follows the algorithm of the Supplementary Material (SM, "Numerical simulations"):
+
+1. Each agent i is active with probability a_i.
+2. An active agent i influences m other agents j, chosen with probability p_ij ~ |x_i - x_j|^(-beta) (Eq. 2, homophily): a link i -> j.
+3. With probability r each contacted agent j influences i back: a link j -> i.
+4. Opinions are updated by integrating Eq. (1) over one time step dt with the fourth-order Runge-Kutta method (RK4).
+5. All links are deleted.
+
+One tick is one integration step, so the simulated time is t = ticks * dt.
+
+## HOW TO USE IT
+
+Press **Fig. 1a**, **Fig. 1b** or **Fig. 1c** to load the parameters of that panel of Fig. 1 (K = 3, r = 0.5 and the panel's alpha and beta) and set up, then press **go**. A run stops at t = t-final (10 in the paper).
+
+**Model (Baumann et al. 2020)**
+
+* **N**: number of agents (paper: 1000).
+* **alpha**: how controversial the topic is.
+* **beta**: homophily; 0 means partners are chosen at random.
+* **K**: strength of social influence.
+* **r**: reciprocity, the probability that a contacted agent influences back.
+* **m**, **epsilon**, **gamma**: number of contacts, smallest activity and exponent of the activity distribution (paper: 10, 0.01, 2.1).
+* **dt**, **t-final**: integration step and run length (paper: 0.01 and 10).
+* **influence-function**: the function that replaces tanh in Eq. (1); see "Influence function" below.
+
+**Extension: number of contacts**
+
+* **m-mode**, **m-multiplier**, **extreme-share**: see "Number of contacts" below.
+
+**Plot settings**
+
+* **n-plotted**: how many (evenly spaced) agents the Opinions plot draws. Drawing all 1000 is slow.
+* **view-range**, **show-links?**: see "View" below.
+
+**Optional: echo-chamber snapshots**: see "Echo-chamber snapshots" below.
+
+In the interface, setup always starts a new random run. In BehaviorSpace the random seed is the run number, so every run can be repeated exactly.
+
+### Influence function
+
+The paper uses tanh(alpha * x) because it is odd (an agent pushes others towards its own side), grows with conviction |x|, and caps the influence of extreme opinions (p. 2). **influence-function** replaces tanh with f(alpha * x) for one of:
+
+* **tanh**: tanh(z), the paper's choice. Levels off quickly.
+* **clip**: max(-1, min(1, z)). Linear up to |x| = 1 / alpha, then a hard cap.
+* **arctan**: (2 / pi) arctan(pi z / 2). Levels off slowly, so moderate agents stay persuasive.
+* **algebraic**: z / sqrt(1 + z^2). Levels off even more slowly.
+* **linear**: z. No cap at all; above alpha_c opinions grow without bound.
+* **sign**: sign(z). Every agent pushes with the same strength, whatever its conviction (the limit alpha -> infinity that the paper mentions); alpha has no effect.
+
+All options except sign have slope alpha at x = 0, and all except linear stay between -1 and 1, so alpha means the same in each and only the levelling off differs. The mean-field alpha_c (Eq. 3) only depends on the slope at 0, so it applies to all of them except sign, for which the monitor shows n/a.
+
+### Number of contacts (extension)
+
+In the paper every active agent contacts m agents. **m-mode** lets the number of contacts depend on how extreme an agent is compared to the rest of the population. Extremeness is |x_i| divided by the largest |x| at that moment, so it runs from 0 (neutral) to 1 (the most extreme agent). It is recomputed every time step.
+
+The **mean number of contacts over all agents always stays m**; the modes only change who gets how many. Each agent gets a weight between 1 and m-multiplier, and the m * N contacts are shared out in proportion to these weights:
+
+* **uniform**: equal weights, so everyone contacts m agents, as in the paper. m-multiplier has no effect.
+* **boost-extreme**: the weight rises linearly with extremeness, so the most extreme agent gets m-multiplier times as many contacts as a neutral one.
+* **uprank-bridging and downrank-toxic**: the reverse: a neutral agent gets m-multiplier times as many contacts as the most extreme one.
+* **uprank-bridging**: like uprank-bridging and downrank-toxic, except for the **extreme-share** % of agents with the largest |x|. Their number of contacts is frozen: while an agent is in that group it keeps the value it had just before it entered, and once it leaves it is recomputed like everyone else's. Only the number of contacts is frozen; the opinions of these agents change as usual. The frozen agents' contacts are taken off the m * N first, and the other agents share the rest in proportion to their weights. So when the frozen agents hold more contacts than they would get otherwise, all other agents get proportionally fewer, the neutral ones (which have the most) losing the most in absolute terms.
+
+Contacts are whole numbers. Everyone is first rounded down, and the contacts left over go one each to the agents that lost most by rounding (the "largest remainder" or Hamilton method), so the total stays exactly m * N. The number of contacts is capped at N - 1, which only matters for small N (the mean is then a bit below m). With m-multiplier = 1 all modes are the same as uniform.
+
+The mean is fixed per agent, not per time step. How many contacts are actually made in a time step depends on which agents are active, and in a polarized state the extreme agents are also the more active ones (Fig. 3b). So a mode that gives extreme agents fewer contacts also lowers the total amount of interaction. Eq. (3) assumes that every active agent contacts exactly m agents, so the α_c monitor shows n/a for any mode other than uniform.
+
+### Echo-chamber snapshots (optional)
+
+The network of a single time step has only a few links per agent. To see who an agent hears over a longer stretch, this part adds up the networks of several time steps ("snapshots"). From that it computes, for every agent, x_nn, the mean opinion of the agents it heard. Plotting x_nn against x shows echo chambers as in Fig. 3a of the paper: agents on the positive side mostly hear positive opinions, agents on the negative side negative ones.
+
+It is off by default. With **collect-snapshots?** off none of this code runs and the model behaves exactly as without it.
+
+How it works:
+
+* **When collection starts.** At the first time step in which the population is polarized: both sides hold more than **snapshot-min-side-share** of the agents (0.2 means each side has more than 20%), and the mean |x| is above **snapshot-min-conviction**. After that the collection goes on even if the population stops being polarized.
+* **What one snapshot is.** The network of one time step (step 2 and 3 above), taken after it is built and before the opinions are updated. A snapshot is taken at the first polarized step and then every **snapshot-spacing** steps, until **snapshot-count** snapshots are taken. Every contact j -> i in a snapshot adds 1 to the weight of the link j -> i in the summed network.
+* **Neighbours.** With **snapshot-neighbours** = in, the neighbours of agent i are the agents that influenced i in at least one snapshot; with "in and out" also the agents that i influenced. With **snapshot-weighted?** off every neighbour counts once; with it on, a neighbour counts once for every snapshot in which the two were in contact.
+* **x_nn and k.** x_nn is the mean opinion of the neighbours (weighted if snapshot-weighted? is on), k is the number of neighbours (or the sum of the weights). Both use the opinions at the moment of the export, i.e. at the end of the collection.
+* **When a run stops.** With collect-snapshots? on, t-final is ignored: a run stops right after the file is written, or at t = **snapshot-max-t** if the population never polarizes (then no file is written). The **snapshots** monitor shows the state: waiting, collecting (n of snapshot-count) or exported.
+
+**Output file**: **snapshot-folder**/snapshots-run-<n>.csv, where n is the BehaviorSpace run number (0 when run from the interface, so the file is overwritten every time). The folder is relative to this model file and must exist, and its name must end with a /. The BehaviorSpace experiments write to one subfolder of data/snapshots/ per m-mode, which R/echo-chambers.Rmd reads (see "Experiments and files"). The default on the interface, ../data/snapshots/, is not read by the notebook, so test runs from the interface don't mix with the experiment data. Each file has one row per agent that has at least one neighbour, with the columns:
+
+* **run**: BehaviorSpace run number
+* **alpha**, **beta**, **K**, **m_mode**: the parameters of the run
+* **t**: time of the export
+* **agent**: the agent's who number
+* **x**: the agent's opinion
+* **x_nn**: mean opinion of its neighbours
+* **k**: number of neighbours (or total weight)
+* **activity**: the agent's activity a_i
+
+### View
+
+Each agent is placed by its opinion (x-axis, from -view-range to +view-range; more extreme opinions sit at the edge) and its activity (y-axis, log scale from epsilon at the bottom to 1 at the top). Positive opinions are blue, negative ones red, as in Fig. 1. When polarized, the view shows the U-shaped relation between activity and opinion of Fig. 3b. With **show-links?** on, the network of the current time step is drawn.
+
+### Plots and monitors
+
+* **Opinions (Fig. 1)**: opinion trajectories, blue while positive and red while negative.
+* **Opinion distribution (Fig. S1b)**: histogram of the current opinions.
+* **|⟨x⟩|**: the absolute value of the mean opinion; its value at the end of a run is what Fig. 2 shows.
+* **Opinion variance** and **Var(x)**: how spread out the opinions are. 0 at consensus, large when opinions are far apart, whether on one side or on both.
+* **mean m**: the mean number of contacts over all agents. It equals m in every m-mode.
+* **⟨a⟩** and **α_c**: mean activity and the mean-field critical controversialness of Eq. (3), alpha_c = 1 / ((1 + r) K m <a>). Below alpha_c the neutral consensus is stable.
+
+## EXPERIMENTS AND FILES
+
+The project folder is organised as follows (paths relative to the project folder):
+
+* netlogo/polarisation.nlogox: this model
+* data/: what the simulations produce and the R notebooks read
+* R/: R notebooks (Rmd) that analyse the data and replicate the paper in R
+* results/: tables and figures made by the R notebooks
+
+### BehaviorSpace experiments
+
+There are six experiments (Tools > BehaviorSpace). In every run the random seed is the run number, so each run can be repeated exactly. Settings not listed below don't affect the results (they only change the display).
+
+**m-modes**
+
+Compares the four m-modes in the three regimes of Fig. 1: consensus (alpha = 0.05, beta = 2), one-sided radicalization (alpha = 3, beta = 0) and polarization (alpha = 3, beta = 3).
+
+    alpha               0.05, 3
+    beta                0, 2, 3
+    m-mode              uniform, boost-extreme,
+                        uprank-bridging and downrank-toxic, uprank-bridging
+    K 3    r 0.5    N 1000    m 10    epsilon 0.01    gamma 2.1    dt 0.01
+    influence-function  tanh
+    m-multiplier 6.7    extreme-share 20
+    collect-snapshots?  off
+    repetitions         100
+    stop                ticks >= 350, i.e. t = 3.5
+
+* All 2 x 3 alpha-beta combinations are run (2400 runs in total); the analysis only uses the three regimes above.
+* The runs stop at t = 3.5 instead of 10 to save computing time.
+* Measures, recorded at the end of each run: abs-mean-opinion (|<x>|), opinion-variance (Var(x)) and mean [ n-contacts ] of turtles (always m).
+* Output: choose "Table output" only and save it as **data/m-modes/m-modes.csv**. R/m-modes-analysis.Rmd reads that file and writes its table and plots to results/m-modes/.
+
+**echo-chambers-uniform**, **echo-chambers-boost-extreme**, **echo-chambers-uprank-bridging-and-downrank-toxic**, **echo-chambers-uprank-bridging**
+
+One experiment per m-mode, which collects echo-chamber snapshots. The four experiments have the same settings and differ only in m-mode and snapshot-folder:
+
+    alpha 4.5    beta 2    K 2.5    r 0.65
+    N 1000    m 10    epsilon 0.01    gamma 2.1    dt 0.01
+    influence-function       tanh
+    m-multiplier 6.7    extreme-share 20
+    collect-snapshots?       on
+    snapshot-count           45
+    snapshot-spacing         1
+    snapshot-min-side-share  0.2
+    snapshot-min-conviction  1
+    snapshot-max-t           50
+    snapshot-neighbours      in
+    snapshot-weighted?       off
+    repetitions              200
+
+    experiment                                        m-mode                               snapshot-folder
+    echo-chambers-uniform                             uniform                              ../data/snapshots/uniform/
+    echo-chambers-boost-extreme                       boost-extreme                        ../data/snapshots/boost-extreme/
+    echo-chambers-uprank-bridging-and-downrank-toxic  uprank-bridging and downrank-toxic   ../data/snapshots/uprank-bridging-and-downrank-toxic/
+    echo-chambers-uprank-bridging                     uprank-bridging                      ../data/snapshots/uprank-bridging/
+
+* A run stops as soon as its snapshot file is written, or at t = 50 if the population never polarizes (then there is no file).
+* Output: each run writes data/snapshots/<m-mode>/snapshots-run-<run number>.csv (see "Echo-chamber snapshots" above). No BehaviorSpace output is needed. The metrics snapshot-state and t only show whether and when each run was exported.
+* R/echo-chambers.Rmd reads every .csv file in these four folders and writes one figure per m-mode to results/snapshots/. Before running an experiment again, empty its folder, otherwise the notebook pools the old and the new runs.
+
+**activity-opinion**
+
+Records the final opinion and activity of every agent, to compare the activity-opinion relation of Fig. 3b of the paper across the four m-modes.
+
+    alpha 3    beta 1    K 2    r 0.65
+    N 1000    m 10    epsilon 0.01    gamma 2.1    dt 0.01
+    t-final             10
+    influence-function  tanh
+    m-mode              uniform, boost-extreme,
+                        uprank-bridging, uprank-bridging and downrank-toxic
+    m-multiplier 6.7    extreme-share 20
+    collect-snapshots?  off
+    repetitions         50
+
+* The runs stop at t-final = 10 (200 runs in total).
+* Measures, recorded at the end of each run: two lists, the opinions and the activities of all agents, both sorted by agent number (map [ a -> [ opinion ] of a ] sort turtles and the same for activity).
+* Output: choose "Table output" only and save it as **data/activity-opinion/activity-opinion.csv**. R/activity-opinion.Rmd reads that file and writes its figure and the table of polarized runs to results/activity-opinion/.
+
+Fig. 2 of the paper (a 20 x 20 grid of alpha and K) is made in R, in R/replication.Rmd, and not with this model.
+
+## THINGS TO NOTICE
+
+* In Fig. 1b (beta = 0) which side wins is decided by chance, so all opinions may end up negative instead of positive as in the paper. Both outcomes are correct (SM, Fig. S6).
+* The polarized state of Fig. 1c does not last forever, but at beta = 3 it lasts far beyond t = 10 (SM, Fig. S2).
+* Compare the α_c monitor with the transition: for beta = 0, runs with alpha well below alpha_c reach consensus.
+
+## IMPLEMENTATION NOTES
+
+* The network is held fixed during the RK4 step, as it is drawn once per time step (SM, step 4). Only the opinions inside tanh(alpha * x) change between the four RK4 stages.
+* Partners are drawn without replacement with `rnd:weighted-n-of` from the bundled rnd extension, which normalizes the weights |x_i - x_j|^(-beta). Distances are floored at 1e-12, because two identical opinions would give an infinite weight.
+* If i contacts j and j also contacts i (or answers back), there is still only one link j -> i, because A_ij is 0 or 1.
+* NetLogo has no tanh, so the model defines it.
+* The finite-size factor N / (N - 1) of the SM's alpha_c (SM, Eq. 7) is left out, as in the paper's Eq. (3).
+* The snapshot file is written with the bundled csv extension.
+
+## CREDITS AND REFERENCES
+
+Baumann, F., Lorenz-Spreen, P., Sokolov, I. M., & Starnini, M. (2020). Modeling echo chambers and polarization dynamics in social networks. *Physical Review Letters*, 124, 048301. https://doi.org/10.1103/PhysRevLett.124.048301
+]]></info>
+  <turtleShapes>
+    <shape name="default" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="5"></point>
+        <point x="40" y="250"></point>
+        <point x="150" y="205"></point>
+        <point x="260" y="250"></point>
+      </polygon>
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+  </turtleShapes>
+  <linkShapes>
+    <shape name="default" curviness="0.0">
+      <lines>
+        <line x="-0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+        <line x="0.0" visible="true">
+          <dash value="1.0"></dash>
+          <dash value="0.0"></dash>
+        </line>
+        <line x="0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+      </lines>
+      <indicator>
+        <shape name="link direction" rotatable="true" editableColorIndex="0">
+          <line endX="90" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+          <line endX="210" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+        </shape>
+      </indicator>
+    </shape>
+  </linkShapes>
+  <previewCommands>setup repeat 300 [ go ]</previewCommands>
+  <experiments>
+    <experiment name="m-modes" repetitions="100" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <metrics>
+        <metric>abs-mean-opinion</metric>
+        <metric>opinion-variance</metric>
+        <metric>mean [ n-contacts ] of turtles</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="alpha">
+          <value value="0.05"></value>
+          <value value="3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="beta">
+          <value value="0"></value>
+          <value value="2"></value>
+          <value value="3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="K">
+          <value value="3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="N">
+          <value value="1000"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="r">
+          <value value="0.5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="m">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="epsilon">
+          <value value="0.01"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="gamma">
+          <value value="2.1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="dt">
+          <value value="0.01"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="t-final">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="n-plotted">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="view-range">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="show-links?">
+          <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="influence-function">
+          <value value="&quot;tanh&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="m-mode">
+          <value value="&quot;uniform&quot;"></value>
+          <value value="&quot;boost-extreme&quot;"></value>
+          <value value="&quot;uprank-bridging and downrank-toxic&quot;"></value>
+          <value value="&quot;uprank-bridging&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="m-multiplier">
+          <value value="6.7"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="extreme-share">
+          <value value="20"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="collect-snapshots?">
+          <value value="false"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="echo-chambers-uniform" repetitions="200" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <metrics>
+        <metric>snapshot-state</metric>
+        <metric>t</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="alpha">
+          <value value="4.5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="beta">
+          <value value="2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="K">
+          <value value="2.5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="r">
+          <value value="0.65"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="N">
+          <value value="1000"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="m">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="epsilon">
+          <value value="0.01"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="gamma">
+          <value value="2.1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="dt">
+          <value value="0.01"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="t-final">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="influence-function">
+          <value value="&quot;tanh&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="m-mode">
+          <value value="&quot;uniform&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="m-multiplier">
+          <value value="6.7"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="extreme-share">
+          <value value="20"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="n-plotted">
+          <value value="100"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="view-range">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="show-links?">
+          <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="collect-snapshots?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-count">
+          <value value="45"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-spacing">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-min-side-share">
+          <value value="0.2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-min-conviction">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-max-t">
+          <value value="50"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-neighbours">
+          <value value="&quot;in&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-weighted?">
+          <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-folder">
+          <value value="&quot;../data/snapshots/uniform/&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="echo-chambers-boost-extreme" repetitions="200" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <metrics>
+        <metric>snapshot-state</metric>
+        <metric>t</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="alpha">
+          <value value="4.5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="beta">
+          <value value="2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="K">
+          <value value="2.5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="r">
+          <value value="0.65"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="N">
+          <value value="1000"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="m">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="epsilon">
+          <value value="0.01"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="gamma">
+          <value value="2.1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="dt">
+          <value value="0.01"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="t-final">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="influence-function">
+          <value value="&quot;tanh&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="m-mode">
+          <value value="&quot;boost-extreme&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="m-multiplier">
+          <value value="6.7"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="extreme-share">
+          <value value="20"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="n-plotted">
+          <value value="100"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="view-range">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="show-links?">
+          <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="collect-snapshots?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-count">
+          <value value="45"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-spacing">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-min-side-share">
+          <value value="0.2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-min-conviction">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-max-t">
+          <value value="50"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-neighbours">
+          <value value="&quot;in&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-weighted?">
+          <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-folder">
+          <value value="&quot;../data/snapshots/boost-extreme/&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="echo-chambers-uprank-bridging-and-downrank-toxic" repetitions="200" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <metrics>
+        <metric>snapshot-state</metric>
+        <metric>t</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="alpha">
+          <value value="4.5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="beta">
+          <value value="2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="K">
+          <value value="2.5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="r">
+          <value value="0.65"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="N">
+          <value value="1000"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="m">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="epsilon">
+          <value value="0.01"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="gamma">
+          <value value="2.1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="dt">
+          <value value="0.01"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="t-final">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="influence-function">
+          <value value="&quot;tanh&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="m-mode">
+          <value value="&quot;uprank-bridging and downrank-toxic&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="m-multiplier">
+          <value value="6.7"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="extreme-share">
+          <value value="20"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="n-plotted">
+          <value value="100"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="view-range">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="show-links?">
+          <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="collect-snapshots?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-count">
+          <value value="45"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-spacing">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-min-side-share">
+          <value value="0.2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-min-conviction">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-max-t">
+          <value value="50"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-neighbours">
+          <value value="&quot;in&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-weighted?">
+          <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-folder">
+          <value value="&quot;../data/snapshots/uprank-bridging-and-downrank-toxic/&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="echo-chambers-uprank-bridging" repetitions="200" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <metrics>
+        <metric>snapshot-state</metric>
+        <metric>t</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="alpha">
+          <value value="4.5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="beta">
+          <value value="2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="K">
+          <value value="2.5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="r">
+          <value value="0.65"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="N">
+          <value value="1000"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="m">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="epsilon">
+          <value value="0.01"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="gamma">
+          <value value="2.1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="dt">
+          <value value="0.01"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="t-final">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="influence-function">
+          <value value="&quot;tanh&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="m-mode">
+          <value value="&quot;uprank-bridging&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="m-multiplier">
+          <value value="6.7"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="extreme-share">
+          <value value="20"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="n-plotted">
+          <value value="100"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="view-range">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="show-links?">
+          <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="collect-snapshots?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-count">
+          <value value="45"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-spacing">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-min-side-share">
+          <value value="0.2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-min-conviction">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-max-t">
+          <value value="50"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-neighbours">
+          <value value="&quot;in&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-weighted?">
+          <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-folder">
+          <value value="&quot;../data/snapshots/uprank-bridging/&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="activity-opinion" repetitions="50" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <metrics>
+        <metric><![CDATA[map [ a -> [ opinion ] of a ] sort turtles]]></metric>
+        <metric><![CDATA[map [ a -> [ activity ] of a ] sort turtles]]></metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="alpha">
+          <value value="3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="beta">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="K">
+          <value value="2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="r">
+          <value value="0.65"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="N">
+          <value value="1000"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="m">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="epsilon">
+          <value value="0.01"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="gamma">
+          <value value="2.1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="dt">
+          <value value="0.01"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="t-final">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="influence-function">
+          <value value="&quot;tanh&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="m-mode">
+          <value value="&quot;uniform&quot;"></value>
+          <value value="&quot;boost-extreme&quot;"></value>
+          <value value="&quot;uprank-bridging&quot;"></value>
+          <value value="&quot;uprank-bridging and downrank-toxic&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="m-multiplier">
+          <value value="6.7"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="extreme-share">
+          <value value="20"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="n-plotted">
+          <value value="100"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="view-range">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="show-links?">
+          <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="collect-snapshots?">
+          <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-count">
+          <value value="45"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-spacing">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-min-side-share">
+          <value value="0.2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-min-conviction">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-max-t">
+          <value value="50"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-neighbours">
+          <value value="&quot;in&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-weighted?">
+          <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="snapshot-folder">
+          <value value="&quot;../data/snapshots/&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+  </experiments>
+</model>
