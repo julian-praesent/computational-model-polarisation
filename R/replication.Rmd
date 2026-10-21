@@ -1,6 +1,8 @@
 ---
 title: "Replication of Baumann et al. (2020) in R"
-output: html_document
+output:
+  pdf_document: default
+  html_document: default
 ---
 
 ```{r setup, include=FALSE}
@@ -283,3 +285,4 @@ lines(alpha_c, K_line, lty = 2, lwd = 3, col = "white")
 dev.off()
 knitr::include_graphics(file)
 ```
+
